@@ -52,3 +52,26 @@ class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
 
     def entropy(self):
         return self.base_dist.entropy()
+
+
+class SquashedMultivariateNormal(pyd.transformed_distribution.TransformedDistribution):
+    def __init__(self, loc, covariance_matrix=None, precision_matrix=None, scale_tril=None):
+        self.loc = loc
+        self.covariance_matrix = covariance_matrix
+        self.precision_matrix = precision_matrix
+        self.scale_tril = scale_tril
+
+        self.base_dist = pyd.MultivariateNormal(loc, covariance_matrix=covariance_matrix,
+                                                precision_matrix=precision_matrix, scale_tril=scale_tril)
+        transforms = [TanhTransform()]
+        super().__init__(self.base_dist, transforms)
+
+    @property
+    def mean(self):
+        mu = self.loc
+        for tr in self.transforms:
+            mu = tr(mu)
+        return mu
+
+    def entropy(self):
+        return self.base_dist.entropy()
