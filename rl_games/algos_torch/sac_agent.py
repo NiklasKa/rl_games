@@ -41,6 +41,8 @@ class SACAgent(BaseAlgorithm):
 
         self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
 
+        self.num_evaluation_steps = config.get("num_evaluation_steps", 10)
+
         print(self.batch_size, self.num_actors, self.num_agents)
 
         self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
@@ -95,6 +97,10 @@ class SACAgent(BaseAlgorithm):
         # TODO: Is there a better way to get the maximum number of episodes?
         self.max_episodes = torch.ones(self.num_actors, device=self._device)*self.num_steps_per_episode
         # self.episode_lengths = np.zeros(self.num_actors, dtype=int)
+
+        # activate exploration
+        self.active_exploration = True
+        self.activate_evaluation = self.create_evaluation_manager()
 
         # tensorboard hparams & metrics
         self._hparams = {
@@ -169,6 +175,7 @@ class SACAgent(BaseAlgorithm):
         self.game_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
         self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
         self.obs = None
+        self.evaluation_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
 
         self.min_alpha = torch.tensor(np.log(1)).float().to(self._device)
 
@@ -220,6 +227,7 @@ class SACAgent(BaseAlgorithm):
 
         self.current_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
+        self.current_evaluation_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
 
         self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self._device)
 
@@ -441,6 +449,7 @@ class SACAgent(BaseAlgorithm):
         self.game_rewards.clear()
         self.game_lengths.clear()
         self.mean_rewards = self.last_mean_rewards = -100500
+        self.evaluation_rewards.clear()
         self.algo_observer.after_clear_stats()
 
     def play_steps(self, random_exploration = False):
@@ -527,6 +536,50 @@ class SACAgent(BaseAlgorithm):
         random_exploration = self.epoch_num < self.num_warmup_steps
         return self.play_steps(random_exploration)
 
+    def create_evaluation_manager(self):
+        target = self
+        class EvaluationManager:
+            def __init__(self):
+                pass
+            def __enter__(self):
+                target.active_exploration = False
+            def __exit__(self, exc_type, exc_value, traceback):
+                target.active_exploration = True
+        return EvaluationManager
+
+    def evaluate_epoch(self):
+        total_time_start = time.time()
+        self.set_eval()
+
+        obs = self.obs
+        for s in range(self.num_evaluation_steps):
+            self.set_eval()
+            with torch.no_grad():
+                # activate policy evaluation
+                with self.activate_evaluation():
+                    action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
+                    next_obs, rewards, dones, infos = self.env_step(action)
+
+            self.current_evaluation_rewards += rewards
+
+            all_done_indices = dones.nonzero(as_tuple=False)
+            done_indices = all_done_indices[::self.num_agents]
+            self.evaluation_rewards.update(self.current_evaluation_rewards[done_indices])
+
+            not_dones = 1.0 - dones.float()
+
+            self.current_evaluation_rewards = self.current_evaluation_rewards * not_dones
+
+            if isinstance(next_obs, dict):
+                next_obs = next_obs['obs']
+
+            self.obs = obs = next_obs.clone()
+
+        total_time_end = time.time()
+        total_time = total_time_end - total_time_start
+
+        return total_time
+
     def train(self):
         self.init_tensors()
         self.algo_observer.after_init(self)
@@ -546,7 +599,9 @@ class SACAgent(BaseAlgorithm):
             self.epoch_num += 1
             step_time, play_time, update_time, epoch_total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses = self.train_epoch()
 
-            total_time += epoch_total_time
+            evaluation_total_time = self.evaluate_epoch()
+
+            total_time += epoch_total_time + evaluation_total_time
 
             curr_frames = self.num_frames_per_epoch
             self.frame += curr_frames
@@ -581,11 +636,14 @@ class SACAgent(BaseAlgorithm):
             if self.game_rewards.current_size > 0:
                 mean_rewards = self.game_rewards.get_mean()
                 mean_lengths = self.game_lengths.get_mean()
+                mean_evaluation_rewards = self.evaluation_rewards.get_mean()
 
                 self.writer.add_scalar('rewards/step', mean_rewards, self.frame)
                 self.writer.add_scalar('rewards/time', mean_rewards, total_time)
                 self.writer.add_scalar('episode_lengths/step', mean_lengths, self.frame)
                 self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+                self.writer.add_scalar('eval-rewards/step', mean_evaluation_rewards, self.frame)
+                self.writer.add_scalar('eval-rewards/time', mean_evaluation_rewards, total_time)
                 checkpoint_name = self.config['name'] + '_ep_' + str(self.epoch_num) + '_rew_' + str(mean_rewards)
                 if mean_rewards > self.last_mean_rewards and self.epoch_num >= self.save_best_after:
                     print('saving next best rewards: ', mean_rewards)
