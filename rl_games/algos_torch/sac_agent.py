@@ -18,6 +18,7 @@ class SACAgent(BaseAlgorithm):
 
     def __init__(self, base_name, params):
 
+        self.seed = params["seed"]
         self.config = config = params['config']
         print(config)
 
@@ -197,7 +198,7 @@ class SACAgent(BaseAlgorithm):
         self.train_dir = config.get('train_dir', 'runs')
 
         # a folder inside of train_dir containing everything related to a particular experiment
-        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name)
+        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name, f"{self.seed}")
 
         # folders inside <train_dir>/<experiment_dir> for a specific purpose
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
