@@ -203,13 +203,15 @@ class SACAgent(BaseAlgorithm):
         # folders inside <train_dir>/<experiment_dir> for a specific purpose
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
         self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
-        self.actions_dir = os.path.join(self.experiment_dir, 'actions')
+        self.actions_exploration_dir = os.path.join(self.experiment_dir, 'actions_explore')
+        self.actions_exploitation_dir = os.path.join(self.experiment_dir, 'actions_exploit')
 
         os.makedirs(self.train_dir, exist_ok=True)
         os.makedirs(self.experiment_dir, exist_ok=True)
         os.makedirs(self.nn_dir, exist_ok=True)
         os.makedirs(self.summaries_dir, exist_ok=True)
-        os.makedirs(self.actions_dir, exist_ok=True)
+        os.makedirs(self.actions_exploration_dir, exist_ok=True)
+        os.makedirs(self.actions_exploitation_dir, exist_ok=True)
 
         self.writer = SummaryWriter(self.experiment_dir)
         print("Run Directory:", self.experiment_name)
@@ -540,7 +542,12 @@ class SACAgent(BaseAlgorithm):
 
     def train_epoch(self):
         random_exploration = self.epoch_num < self.num_warmup_steps
-        return self.play_steps(random_exploration)
+        steps_return = self.play_steps(random_exploration)
+
+        # evaluate and save action distribution of exploration policy
+        self.evaluate_exploration_actions()
+
+        return steps_return
 
     def create_evaluation_manager(self):
         target = self
@@ -562,6 +569,7 @@ class SACAgent(BaseAlgorithm):
         self.set_eval()
 
         obs = self.obs
+        actions = torch.empty((self.num_evaluation_steps, self.num_agents, self.actions_num), device=self._device)
         for s in range(self.num_evaluation_steps):
             self.set_eval()
             with torch.no_grad():
@@ -569,6 +577,9 @@ class SACAgent(BaseAlgorithm):
                 with self.activate_evaluation():
                     action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
                     next_obs, rewards, dones, infos = self.env_step(action)
+
+                    # save action
+                    actions[s] = action
 
             self.current_evaluation_rewards += rewards
 
@@ -588,17 +599,25 @@ class SACAgent(BaseAlgorithm):
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
 
+        # evaluate and save action distribution of exploitation policy
+        fn = os.path.join(self.actions_exploitation_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
+        actions = torch.flatten(actions, end_dim=1)
+        self.evaluate_actions(actions, fn)
+
         return total_time
 
-    def evaluate_actions(self):
+    def evaluate_exploration_actions(self):
         # create filename
-        fn = os.path.join(self.actions_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
+        fn = os.path.join(self.actions_exploration_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
 
         # get actions of last epoch from replay buffer
         num_actions_per_episode = self.num_actors * self.num_steps_per_episode
         idxs = self.replay_buffer.idx - torch.arange(num_actions_per_episode)
         actions = self.replay_buffer.actions[idxs]
 
+        self.evaluate_actions(actions, fn)
+
+    def evaluate_actions(self, actions: torch.Tensor, fn: str):
         # compute density over actions space for each action dimension
         # @TODO: replace list comprehension with parallel implementation
         hist = [(f"dim_{i}",
@@ -630,10 +649,9 @@ class SACAgent(BaseAlgorithm):
 
         while True:
             self.epoch_num += 1
-            step_time, play_time, update_time, epoch_total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses = self.train_epoch()
 
-            # evaluate and save sampled actions of current epoch
-            self.evaluate_actions()
+            # train epoch
+            step_time, play_time, update_time, epoch_total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses = self.train_epoch()
 
             # evaluate epoch
             evaluation_total_time = self.evaluate_epoch()
