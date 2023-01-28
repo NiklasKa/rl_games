@@ -37,7 +37,7 @@ class SACAgent(BaseAlgorithm):
 
         self.max_env_steps = config.get("max_env_steps", 1000)  # temporary, in future we will use other approach
 
-        self.num_evaluation_steps = config.get("num_evaluation_steps", 10)
+        self.num_evaluation_episodes = config.get("num_evaluation_episodes", 10)
 
         print(self.batch_size, self.num_actors, self.num_agents)
 
@@ -174,7 +174,6 @@ class SACAgent(BaseAlgorithm):
         self.game_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
         self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
         self.obs = None
-        self.evaluation_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
 
         self.min_alpha = torch.tensor(np.log(1)).float().to(self._device)
 
@@ -230,7 +229,9 @@ class SACAgent(BaseAlgorithm):
 
         self.current_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
-        self.current_evaluation_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
+
+        self.evaluation_rewards = torch.empty(self.num_evaluation_episodes, dtype=torch.float32, device=self._device)
+        self.evaluation_lengths = torch.empty(self.num_evaluation_episodes, dtype=torch.long, device=self._device)
 
         self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self._device)
 
@@ -568,40 +569,50 @@ class SACAgent(BaseAlgorithm):
         total_time_start = time.time()
         self.set_eval()
 
-        obs = self.obs
-        actions = torch.empty((self.num_evaluation_steps, self.num_agents, self.actions_num), device=self._device)
-        for s in range(self.num_evaluation_steps):
-            self.set_eval()
-            with torch.no_grad():
-                # activate policy evaluation
-                with self.activate_evaluation():
-                    action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
-                    next_obs, rewards, dones, infos = self.env_step(action)
+        actions = torch.empty((0, self.actions_num), device=self._device)
 
-                    # save action
-                    actions[s] = action
+        for i in range(self.num_evaluation_episodes):
+            # reset agent at beginning of episode
+            self.obs = self.env_reset()
+            obs = self.obs
+            if isinstance(obs, dict):
+                obs = obs['obs']
+            batch_size = self.num_agents * self.num_actors
+            env_finished_in_episode = torch.zeros(batch_size, dtype=torch.bool, device=self._device)
+            current_evaluation_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
+            current_evaluation_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
 
-            self.current_evaluation_rewards += rewards
+            for s in range(self.max_env_steps):
+                with torch.no_grad():
+                    # activate policy evaluation
+                    with self.activate_evaluation():
+                        action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
+                        next_obs, rewards, dones, infos = self.env_step(action)
 
-            all_done_indices = dones.nonzero(as_tuple=False)
-            done_indices = all_done_indices[::self.num_agents]
-            self.evaluation_rewards.update(self.current_evaluation_rewards[done_indices])
+                        # save action
+                        actions = torch.cat((actions, action[~env_finished_in_episode]), 0)
 
-            not_dones = 1.0 - dones.float()
+                # only update values of envs that haven't finished in current episode
+                current_evaluation_rewards = torch.where(env_finished_in_episode, current_evaluation_rewards, rewards)
+                current_evaluation_lengths[~env_finished_in_episode] += 1
+                env_finished_in_episode[dones == 1] = True
 
-            self.current_evaluation_rewards = self.current_evaluation_rewards * not_dones
+                if isinstance(next_obs, dict):
+                    next_obs = next_obs['obs']
+                self.obs = obs = next_obs.clone()
 
-            if isinstance(next_obs, dict):
-                next_obs = next_obs['obs']
+                if torch.all(env_finished_in_episode):
+                    break
 
-            self.obs = obs = next_obs.clone()
+            # compute mean over rewards and episode length
+            self.evaluation_rewards[i] = torch.mean(current_evaluation_rewards)
+            self.evaluation_lengths[i] = torch.mean(current_evaluation_lengths.float())
 
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
 
         # evaluate and save action distribution of exploitation policy
         fn = os.path.join(self.actions_exploitation_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
-        actions = torch.flatten(actions, end_dim=1)
         self.evaluate_actions(actions, fn)
 
         return total_time
@@ -691,14 +702,21 @@ class SACAgent(BaseAlgorithm):
             if self.game_rewards.current_size > 0:
                 mean_rewards = self.game_rewards.get_mean()
                 mean_lengths = self.game_lengths.get_mean()
-                mean_evaluation_rewards = self.evaluation_rewards.get_mean()
+                mean_evaluation_rewards = torch.mean(self.evaluation_rewards.float())
+                mean_evaluation_lengths = torch.mean(self.evaluation_lengths.float())
 
+                # training data
                 self.writer.add_scalar('rewards/step', mean_rewards, self.frame)
                 self.writer.add_scalar('rewards/time', mean_rewards, total_time)
                 self.writer.add_scalar('episode_lengths/step', mean_lengths, self.frame)
                 self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
-                self.writer.add_scalar('eval-rewards/step', mean_evaluation_rewards, self.frame)
-                self.writer.add_scalar('eval-rewards/time', mean_evaluation_rewards, total_time)
+
+                # evaluation data
+                self.writer.add_scalar('evaluation/rewards-step', mean_evaluation_rewards, self.frame)
+                self.writer.add_scalar('evaluation/rewards-time', mean_evaluation_rewards, total_time)
+                self.writer.add_scalar('evaluation/episode_lengths-step', mean_evaluation_lengths, self.frame)
+                self.writer.add_scalar('evaluation/episode_lengths-time', mean_evaluation_lengths, total_time)
+
                 checkpoint_name = self.config['name'] + '_ep_' + str(self.epoch_num) + '_rew_' + str(mean_rewards)
                 if mean_rewards > self.last_mean_rewards and self.epoch_num >= self.save_best_after:
                     print('saving next best rewards: ', mean_rewards)
