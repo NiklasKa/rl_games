@@ -627,7 +627,7 @@ class SACAgent(BaseAlgorithm):
         fn = os.path.join(self.actions_exploration_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
 
         # get actions of last epoch from replay buffer
-        num_actions_per_episode = self.num_actors * self.num_steps_per_episode
+        num_actions_per_episode = self.num_agents * self.num_actors * self.num_steps_per_episode
         idxs = self.replay_buffer.idx - torch.arange(num_actions_per_episode)
         actions = self.replay_buffer.actions[idxs]
 
