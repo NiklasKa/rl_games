@@ -34,6 +34,7 @@ class SACAgent(BaseAlgorithm):
         self.replay_buffer_size = config["replay_buffer_size"]
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.normalize_input = config.get("normalize_input", False)
+        self.num_rl_updates = config.get("num_rl_updates", 1)
 
         self.max_env_steps = config.get("max_env_steps", 1000)  # temporary, in future we will use other approach
 
@@ -113,6 +114,7 @@ class SACAgent(BaseAlgorithm):
             'critic_lr': self.config['critic_lr'],
             'alpha_lr': self.config['alpha_lr'],
             'target_entropy_coef': self.target_entropy_coef,
+            'num_rl_updates': self.num_rl_updates,
         }
 
         self._metrics = {
@@ -523,7 +525,9 @@ class SACAgent(BaseAlgorithm):
             if not random_exploration:
                 self.set_train()
                 update_time_start = time.time()
-                actor_loss_info, critic1_loss, critic2_loss = self.update(self.epoch_num)
+
+                for _ in range(self.num_rl_updates):
+                    actor_loss_info, critic1_loss, critic2_loss = self.update(self.epoch_num)
                 update_time_end = time.time()
                 update_time = update_time_end - update_time_start
 
@@ -577,6 +581,7 @@ class SACAgent(BaseAlgorithm):
             obs = self.obs
             if isinstance(obs, dict):
                 obs = obs['obs']
+
             batch_size = self.num_agents * self.num_actors
             env_finished_in_episode = torch.zeros(batch_size, dtype=torch.bool, device=self._device)
             current_evaluation_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
@@ -593,7 +598,7 @@ class SACAgent(BaseAlgorithm):
                         actions = torch.cat((actions, action[~env_finished_in_episode]), 0)
 
                 # only update values of envs that haven't finished in current episode
-                current_evaluation_rewards = torch.where(env_finished_in_episode, current_evaluation_rewards, rewards)
+                current_evaluation_rewards = torch.where(env_finished_in_episode, current_evaluation_rewards, current_evaluation_rewards + rewards)
                 current_evaluation_lengths[~env_finished_in_episode] += 1
                 env_finished_in_episode[dones == 1] = True
 
@@ -684,6 +689,7 @@ class SACAgent(BaseAlgorithm):
             self.writer.add_scalar('performance/step_fps', fps_step, self.frame)
             self.writer.add_scalar('performance/rl_update_time', update_time, self.frame)
             self.writer.add_scalar('performance/step_inference_time', play_time, self.frame)
+            self.writer.add_scalar('performance/evaluation_time', evaluation_total_time, self.frame)
             self.writer.add_scalar('performance/step_time', step_time, self.frame)
 
             if self.epoch_num >= self.num_warmup_steps:
