@@ -74,25 +74,10 @@ class BasePlayer(object):
         self.max_steps = 108000 // 4
         self.device = torch.device(self.device_name)
 
-        pbt_str = ''
-        self.population_based_training = config.get('population_based_training', False)
-        if self.population_based_training:
-            # in PBT, make sure experiment name contains a unique id of the policy within a population
-            pbt_str = f'_pbt_{config["pbt_idx"]:02d}'
-        full_experiment_name = config.get('full_experiment_name', None)
-        if full_experiment_name:
-            print(f'Exact experiment name requested from command line: {full_experiment_name}')
-            self.experiment_name = full_experiment_name
-        else:
-            self.experiment_name = config['name'] + pbt_str + datetime.now().strftime("_%d-%H-%M-%S")
         self.train_dir = config.get('train_dir', 'runs')
+        self.experiment_dir = os.path.join(self.train_dir, config['name'])
 
-        # a folder inside of train_dir containing everything related to a particular experiment
-        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name, f"{self.seed}")
-
-        self.actions_exploitation_dir = os.path.join(self.experiment_dir, 'actions_exploit')
         self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn')
-        os.makedirs(self.actions_exploitation_dir, exist_ok=True)
         os.makedirs(self.eval_nn_dir, exist_ok=True)
 
         self.evaluation = self.player_config.get("evaluation", False) # run player as evaluation player to evaluate new checkpoints
@@ -375,9 +360,9 @@ class BasePlayer(object):
                 # log action histogram
                 a_min = float(self.action_space.low.min())
                 a_max = float(self.action_space.high.max())
+                bin_edges = torch.linspace(a_min, a_max, self.num_action_bins + 1)
                 for  i in range(actions.shape[1]):
-                    hist, bin_edges = torch.histogram(actions[:, i], self.num_action_bins, range=(a_min, a_max))
-                    self.writer.add_histogram(f"actions/dim{i}", hist, frame, bin_edges)
+                    self.writer.add_histogram(f"actions/dim{i}", actions[:, i], frame, bins=bin_edges)
 
                 self.writer.add_scalar('performance/step_fps', fps_step, frame)
                 self.writer.add_scalar('performance/step_time', step_time, frame)

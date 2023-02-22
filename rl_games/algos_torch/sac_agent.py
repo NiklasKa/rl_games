@@ -184,22 +184,10 @@ class SACAgent(BaseAlgorithm):
         self.play_time = 0
         self.epoch_num = 0
 
-        # TODO: put it into the separate class
-        pbt_str = ''
-        self.population_based_training = config.get('population_based_training', False)
-        if self.population_based_training:
-            # in PBT, make sure experiment name contains a unique id of the policy within a population
-            pbt_str = f'_pbt_{config["pbt_idx"]:02d}'
-        full_experiment_name = config.get('full_experiment_name', None)
-        if full_experiment_name:
-            print(f'Exact experiment name requested from command line: {full_experiment_name}')
-            self.experiment_name = full_experiment_name
-        else:
-            self.experiment_name = config['name'] + pbt_str + datetime.now().strftime("_%d-%H-%M-%S")
         self.train_dir = config.get('train_dir', 'runs')
 
         # a folder inside of train_dir containing everything related to a particular experiment
-        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name, f"{self.seed}")
+        self.experiment_dir = os.path.join(self.train_dir, config['name'])
 
         # folders inside <experiment_dir>=<train_dir>/<experiment_name>/<seed> for a specific purpose
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
@@ -210,7 +198,7 @@ class SACAgent(BaseAlgorithm):
             os.makedirs(d, exist_ok=True)
 
         self.writer = SummaryWriter(self.experiment_dir)
-        print("Run Directory:", self.experiment_name)
+        print("Run Directory:", self.experiment_dir)
 
         self.is_tensor_obses = False
         self.is_rnn = False
@@ -579,9 +567,9 @@ class SACAgent(BaseAlgorithm):
             num_actions_per_episode = self.num_agents * self.num_actors * self.num_steps_per_episode
             idxs = self.replay_buffer.idx - torch.arange(num_actions_per_episode)
             actions = self.replay_buffer.actions[idxs]
+            bin_edges = torch.linspace(self.action_range[0], self.action_range[1], self.num_action_bins + 1)
             for i in range(actions.shape[1]):
-                hist, bin_edges = torch.histogram(actions[:, i], self.num_action_bins, range=self.action_range)
-                self.writer.add_histogram(f"actions/dim{i}", hist, self.frame, bin_edges)
+                self.writer.add_histogram(f"actions/dim{i}", actions[:, i], self.frame, bins=bin_edges)
 
             if self.epoch_num >= self.num_warmup_steps:
                 self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(actor_losses).item(), self.frame)
