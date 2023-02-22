@@ -3,6 +3,12 @@ import gym
 import numpy as np
 import torch
 import copy
+import os
+import re
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.summary import hparams
+
 from rl_games.common import env_configurations
 from rl_games.algos_torch import  model_builder
 
@@ -51,6 +57,44 @@ class BasePlayer(object):
         self.render_sleep = self.player_config.get('render_sleep', 0.002)
         self.max_steps = 108000 // 4
         self.device = torch.device(self.device_name)
+
+        pbt_str = ''
+        self.population_based_training = config.get('population_based_training', False)
+        if self.population_based_training:
+            # in PBT, make sure experiment name contains a unique id of the policy within a population
+            pbt_str = f'_pbt_{config["pbt_idx"]:02d}'
+        full_experiment_name = config.get('full_experiment_name', None)
+        if full_experiment_name:
+            print(f'Exact experiment name requested from command line: {full_experiment_name}')
+            self.experiment_name = full_experiment_name
+        else:
+            self.experiment_name = config['name'] + pbt_str + datetime.now().strftime("_%d-%H-%M-%S")
+        self.train_dir = config.get('train_dir', 'runs')
+
+        # a folder inside of train_dir containing everything related to a particular experiment
+        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name, f"{self.seed}")
+
+        self.actions_exploitation_dir = os.path.join(self.experiment_dir, 'actions_exploit')
+        self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn')
+        os.makedirs(self.actions_exploitation_dir, exist_ok=True)
+        os.makedirs(self.eval_nn_dir, exist_ok=True)
+
+        self.evaluation = self.player_config.get("evaluation", False) # run player as evaluation player to evaluate new checkpoints
+        self.num_action_bins = config.get("num_action_bins", 100)
+
+        self.writer = SummaryWriter(self.experiment_dir)
+
+        # tensorboard hparams & metrics
+        self._hparams = {
+            'games_num': self.games_num,
+            'n_games_life': self.n_game_life,
+            'max_steps': self.max_steps,
+        }
+
+        self._metrics = {
+            "rewards/step": 0,
+        }
+
 
     def load_networks(self, params):
         builder = model_builder.ModelBuilder()
@@ -161,7 +205,7 @@ class BasePlayer(object):
             self.states = [torch.zeros((s.size()[0], self.batch_size, s.size(
             )[2]), dtype=torch.float32).to(self.device) for s in rnn_states]
 
-    def run(self):
+    def _run(self):
         n_games = self.games_num
         render = self.render_env
         n_game_life = self.n_game_life
@@ -185,6 +229,8 @@ class BasePlayer(object):
             has_masks = self.env.has_action_mask()
 
         need_init_rnn = self.is_rnn
+        actions = torch.empty((0, 0), device=self.device)
+
         for _ in range(n_games):
             if games_played >= n_games:
                 break
@@ -213,6 +259,11 @@ class BasePlayer(object):
                 obses, r, done, info = self.env_step(self.env, action)
                 cr += r
                 steps += 1
+
+                # collect actions if set to true
+                if self.evaluation:
+                    # save action
+                    actions = torch.cat((actions, action), 0)
 
                 if render:
                     self.env.render(mode='human')
@@ -257,6 +308,7 @@ class BasePlayer(object):
                     if batch_size//self.num_agents == 1 or games_played >= n_games:
                         break
 
+
         print(sum_rewards)
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps /
@@ -264,6 +316,62 @@ class BasePlayer(object):
         else:
             print('av reward:', sum_rewards / games_played * n_game_life,
                   'av steps:', sum_steps / games_played * n_game_life)
+
+        mean_rewards = sum_rewards / games_played * n_game_life
+        mean_lengths = sum_steps / games_played * n_game_life
+
+        return mean_rewards, mean_lengths, games_played, actions if self.evaluation else None
+
+    def run(self):
+        if self.evaluation:
+            # evaluation player checks all checkpoints and logs to tensorboard
+            exp, ssi, sei = hparams(self._hparams, metric_dict=self._metrics)
+            self.writer.file_writer.add_summary(exp)
+            self.writer.file_writer.add_summary(ssi)
+            self.writer.file_writer.add_summary(sei)
+
+            total_time = 0
+
+            checkpoints = list(filter(os.path.isfile, os.listdir(self.eval_nn_dir)))
+            checkpoints = [os.path.join(self.eval_nn_dir, c) for c in checkpoints]
+            checkpoints.sort(key=lambda x: os.path.getmtime(x))
+
+            for fn in checkpoints:
+                # check filename and get frame
+                match = re.search(r"/frame_(\d+).*.pth/gm", fn)
+                if not match:
+                    continue
+                frame = int(match.group(1))
+
+                # restore checkpoint
+                self.restore(fn)
+
+                # run evaluation
+                step_start = time.time()
+                mean_rewards, mean_lengths, games_played, actions = self._run()
+                step_end = time.time()
+
+                step_time = step_end - step_start
+                fps_step = step_time / (mean_lengths * games_played / self.n_game_life)
+                total_time += step_time
+
+                # log action histogram
+                a_min = float(self.action_space.low.min())
+                a_max = float(self.action_space.high.max())
+                for  i in range(actions.shape[1]):
+                    hist, bin_edges = torch.histogram(actions[:, i], self.num_action_bins, range=(a_min, a_max))
+                    self.writer.add_histogram(f"actions/dim{i}", hist, frame, bin_edges)
+
+                self.writer.add_scalar('performance/step_fps', fps_step, frame)
+                self.writer.add_scalar('performance/step_time', step_time, frame)
+
+                self.writer.add_scalar('rewards/step', mean_rewards, frame)
+                self.writer.add_scalar('rewards/time', mean_rewards, total_time)
+                self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
+                self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+
+        else:
+            self._run()
 
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape

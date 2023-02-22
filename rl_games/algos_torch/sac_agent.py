@@ -38,8 +38,6 @@ class SACAgent(BaseAlgorithm):
 
         self.max_env_steps = config.get("max_env_steps", 1000)  # temporary, in future we will use other approach
 
-        self.num_evaluation_episodes = config.get("num_evaluation_episodes", 10)
-
         print(self.batch_size, self.num_actors, self.num_agents)
 
         self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
@@ -94,10 +92,6 @@ class SACAgent(BaseAlgorithm):
         # TODO: Is there a better way to get the maximum number of episodes?
         self.max_episodes = torch.ones(self.num_actors, device=self._device) * self.num_steps_per_episode
         # self.episode_lengths = np.zeros(self.num_actors, dtype=int)
-
-        # activate exploration
-        self.active_exploration = True
-        self.activate_evaluation = self.create_evaluation_manager()
 
         # tensorboard hparams & metrics
         self._hparams = {
@@ -161,6 +155,8 @@ class SACAgent(BaseAlgorithm):
         # self.c2_loss = nn.SmoothL1Loss()
 
         self.save_best_after = config.get('save_best_after', 500)
+        self.save_frequency = self.config.get("save_frequency", 50)
+        self.eval_frequency = self.config.get("eval_frequency", 10)
         self.print_stats = config.get('print_stats', True)
         self.rnn_states = None
         self.name = base_name
@@ -201,18 +197,15 @@ class SACAgent(BaseAlgorithm):
         # a folder inside of train_dir containing everything related to a particular experiment
         self.experiment_dir = os.path.join(self.train_dir, self.experiment_name, f"{self.seed}")
 
-        # folders inside <train_dir>/<experiment_dir> for a specific purpose
+        # folders inside <experiment_dir>=<train_dir>/<experiment_name>/<seed> for a specific purpose
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
+        self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn')
         self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
         self.actions_exploration_dir = os.path.join(self.experiment_dir, 'actions_explore')
-        self.actions_exploitation_dir = os.path.join(self.experiment_dir, 'actions_exploit')
 
-        os.makedirs(self.train_dir, exist_ok=True)
-        os.makedirs(self.experiment_dir, exist_ok=True)
-        os.makedirs(self.nn_dir, exist_ok=True)
-        os.makedirs(self.summaries_dir, exist_ok=True)
-        os.makedirs(self.actions_exploration_dir, exist_ok=True)
-        os.makedirs(self.actions_exploitation_dir, exist_ok=True)
+        for d in [self.train_dir, self.experiment_dir, self.nn_dir, self.eval_nn_dir, self.summaries_dir,
+                    self.actions_exploration_dir]:
+            os.makedirs(d, exist_ok=True)
 
         self.writer = SummaryWriter(self.experiment_dir)
         print("Run Directory:", self.experiment_name)
@@ -231,9 +224,6 @@ class SACAgent(BaseAlgorithm):
 
         self.current_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
-
-        self.evaluation_rewards = torch.empty(self.num_evaluation_episodes, dtype=torch.float32, device=self._device)
-        self.evaluation_lengths = torch.empty(self.num_evaluation_episodes, dtype=torch.long, device=self._device)
 
         self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self._device)
 
@@ -459,7 +449,6 @@ class SACAgent(BaseAlgorithm):
         self.game_rewards.clear()
         self.game_lengths.clear()
         self.mean_rewards = self.last_mean_rewards = -100500
-        self.evaluation_rewards.clear()
         self.algo_observer.after_clear_stats()
 
     def play_steps(self, random_exploration=False):
@@ -549,104 +538,7 @@ class SACAgent(BaseAlgorithm):
         random_exploration = self.epoch_num < self.num_warmup_steps
         steps_return = self.play_steps(random_exploration)
 
-        # evaluate and save action distribution of exploration policy
-        self.evaluate_exploration_actions()
-
         return steps_return
-
-    def create_evaluation_manager(self):
-        target = self
-
-        class EvaluationManager:
-            def __init__(self):
-                pass
-
-            def __enter__(self):
-                target.active_exploration = False
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                target.active_exploration = True
-
-        return EvaluationManager
-
-    def evaluate_epoch(self):
-        total_time_start = time.time()
-        self.set_eval()
-
-        actions = torch.empty((0, self.actions_num), device=self._device)
-
-        for i in range(self.num_evaluation_episodes):
-            # reset agent at beginning of episode
-            self.obs = self.env_reset()
-            obs = self.obs
-            if isinstance(obs, dict):
-                obs = obs['obs']
-
-            batch_size = self.num_agents * self.num_actors
-            env_finished_in_episode = torch.zeros(batch_size, dtype=torch.bool, device=self._device)
-            current_evaluation_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self._device)
-            current_evaluation_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
-
-            for s in range(self.max_env_steps):
-                with torch.no_grad():
-                    # activate policy evaluation
-                    with self.activate_evaluation():
-                        action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
-                        next_obs, rewards, dones, infos = self.env_step(action)
-
-                        # save action
-                        actions = torch.cat((actions, action[~env_finished_in_episode]), 0)
-
-                # only update values of envs that haven't finished in current episode
-                current_evaluation_rewards = torch.where(env_finished_in_episode, current_evaluation_rewards, current_evaluation_rewards + rewards)
-                current_evaluation_lengths[~env_finished_in_episode] += 1
-                env_finished_in_episode[dones == 1] = True
-
-                if isinstance(next_obs, dict):
-                    next_obs = next_obs['obs']
-                self.obs = obs = next_obs.clone()
-
-                if torch.all(env_finished_in_episode):
-                    break
-
-            # compute mean over rewards and episode length
-            self.evaluation_rewards[i] = torch.mean(current_evaluation_rewards)
-            self.evaluation_lengths[i] = torch.mean(current_evaluation_lengths.float())
-
-        total_time_end = time.time()
-        total_time = total_time_end - total_time_start
-
-        # evaluate and save action distribution of exploitation policy
-        fn = os.path.join(self.actions_exploitation_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
-        self.evaluate_actions(actions, fn)
-
-        return total_time
-
-    def evaluate_exploration_actions(self):
-        # create filename
-        fn = os.path.join(self.actions_exploration_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
-
-        # get actions of last epoch from replay buffer
-        num_actions_per_episode = self.num_agents * self.num_actors * self.num_steps_per_episode
-        idxs = self.replay_buffer.idx - torch.arange(num_actions_per_episode)
-        actions = self.replay_buffer.actions[idxs]
-
-        self.evaluate_actions(actions, fn)
-
-    def evaluate_actions(self, actions: torch.Tensor, fn: str):
-        # compute density over actions space for each action dimension
-        # @TODO: replace list comprehension with parallel implementation
-        hist = [(f"dim_{i}",
-                 torch.histc(actions[:, i], self.num_action_bins, min=self.action_range[0], max=self.action_range[1]))
-                for i in range(self.actions_num)]
-
-        state = {
-            'steps': self.step,
-            'hist': dict(hist),
-            'range': self.action_range
-        }
-
-        torch_ext.safe_filesystem_op(torch.save, state, fn)
 
     def train(self):
         self.init_tensors()
@@ -669,10 +561,6 @@ class SACAgent(BaseAlgorithm):
             # train epoch
             step_time, play_time, update_time, epoch_total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses = self.train_epoch()
 
-            # evaluate epoch
-            evaluation_total_time = self.evaluate_epoch()
-            total_time += epoch_total_time + evaluation_total_time
-
             curr_frames = self.num_frames_per_epoch
             self.frame += curr_frames
 
@@ -689,8 +577,15 @@ class SACAgent(BaseAlgorithm):
             self.writer.add_scalar('performance/step_fps', fps_step, self.frame)
             self.writer.add_scalar('performance/rl_update_time', update_time, self.frame)
             self.writer.add_scalar('performance/step_inference_time', play_time, self.frame)
-            self.writer.add_scalar('performance/evaluation_time', evaluation_total_time, self.frame)
             self.writer.add_scalar('performance/step_time', step_time, self.frame)
+
+            # log action histogram
+            num_actions_per_episode = self.num_agents * self.num_actors * self.num_steps_per_episode
+            idxs = self.replay_buffer.idx - torch.arange(num_actions_per_episode)
+            actions = self.replay_buffer.actions[idxs]
+            for i in range(actions.shape[1]):
+                hist, bin_edges = torch.histogram(actions[:, i], self.num_action_bins, range=self.action_range)
+                self.writer.add_histogram(f"actions/dim{i}", hist, self.frame, bin_edges)
 
             if self.epoch_num >= self.num_warmup_steps:
                 self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(actor_losses).item(), self.frame)
@@ -708,8 +603,6 @@ class SACAgent(BaseAlgorithm):
             if self.game_rewards.current_size > 0:
                 mean_rewards = self.game_rewards.get_mean()
                 mean_lengths = self.game_lengths.get_mean()
-                mean_evaluation_rewards = torch.mean(self.evaluation_rewards.float())
-                mean_evaluation_lengths = torch.mean(self.evaluation_lengths.float())
 
                 # training data
                 self.writer.add_scalar('rewards/step', mean_rewards, self.frame)
@@ -717,25 +610,24 @@ class SACAgent(BaseAlgorithm):
                 self.writer.add_scalar('episode_lengths/step', mean_lengths, self.frame)
                 self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
 
-                # evaluation data
-                self.writer.add_scalar('evaluation/rewards-step', mean_evaluation_rewards, self.frame)
-                self.writer.add_scalar('evaluation/rewards-time', mean_evaluation_rewards, total_time)
-                self.writer.add_scalar('evaluation/episode_lengths-step', mean_evaluation_lengths, self.frame)
-                self.writer.add_scalar('evaluation/episode_lengths-time', mean_evaluation_lengths, total_time)
+                # save evaluation checkpoints
+                if not self.epoch_num % self.eval_frequency:
+                    checkpoint_name = f"frame_{self.frame}"
+                    self.save(os.path.join(self.eval_nn_dir, checkpoint_name))
 
-                checkpoint_name = self.config['name'] + '_ep_' + str(self.epoch_num) + '_rew_' + str(mean_rewards)
+                # save checkpoint with best reward
                 if mean_rewards > self.last_mean_rewards and self.epoch_num >= self.save_best_after:
                     print('saving next best rewards: ', mean_rewards)
                     self.last_mean_rewards = mean_rewards
-                    self.save(os.path.join(self.nn_dir, self.config['name']))
+                    checkpoint_name = self.config['name'] + '_ep_' + str(self.epoch_num) + '_rew_' + str(mean_rewards)
+                    self.save(os.path.join(self.nn_dir, checkpoint_name))
                     if self.last_mean_rewards > self.config.get('score_to_win', float('inf')):
                         print('Network won!')
-                        self.save(os.path.join(self.nn_dir, checkpoint_name))
                         return self.last_mean_rewards, self.epoch_num
 
                 if self.epoch_num >= self.max_epochs:
                     self.save(os.path.join(self.nn_dir,
-                                           'last_' + self.config['name'] + 'ep' + str(self.epoch_num) + 'rew' + str(
+                                           'last_' + self.config['name'] + '_ep_' + str(self.epoch_num) + '_rew_' + str(
                                                mean_rewards)))
                     print('MAX EPOCHS NUM!')
                     return self.last_mean_rewards, self.epoch_num
