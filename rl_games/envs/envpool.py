@@ -1,7 +1,6 @@
 from rl_games.common.ivecenv import IVecEnv
 import gym
 import numpy as np
-import torch.utils.dlpack as tpack
 
 class Envpool(IVecEnv):
     def __init__(self, config_name, num_actors, **kwargs):
@@ -21,10 +20,11 @@ class Envpool(IVecEnv):
             self.observation_space= gym.spaces.Dict({
                 'observation' : self.env.observation_space,
                 'reward' : gym.spaces.Box(low=0, high=1, shape=( ), dtype=np.float32),
-                'last_action': gym.spaces.Box(low=0, high=self.env.action_space.n, shape=(), dtype=np.long)
+                'last_action': gym.spaces.Box(low=0, high=self.env.action_space.n, shape=(), dtype=int)
             })
         else:
             self.observation_space = self.env.observation_space
+
         self.ids = np.arange(0, num_actors)
         self.action_space = self.env.action_space
         self.scores = np.zeros(num_actors)

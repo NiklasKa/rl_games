@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -9,9 +10,12 @@ from rl_games.common  import common_losses
 from rl_games.common import datasets
 from rl_games.common import schedulers
 
+
 class CentralValueTrain(nn.Module):
-    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, seq_len, normalize_value,network, config, writter, max_epochs, multi_gpu):
+    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, 
+                seq_len, normalize_value, network, config, writter, max_epochs, multi_gpu, zero_rnn_on_done):
         nn.Module.__init__(self)
+
         self.ppo_device = ppo_device
         self.num_agents, self.horizon_length, self.num_actors, self.seq_len = num_agents, horizon_length, num_actors, seq_len
         self.normalize_value = normalize_value
@@ -23,6 +27,8 @@ class CentralValueTrain(nn.Module):
         self.truncate_grads = config.get('truncate_grads', False)
         self.config = config
         self.normalize_input = config['normalize_input']
+        self.zero_rnn_on_done = zero_rnn_on_done
+
         state_config = {
             'value_size' : value_size,
             'input_shape' : state_shape,
@@ -36,16 +42,19 @@ class CentralValueTrain(nn.Module):
         self.model = network.build(state_config)
         self.lr = float(config['learning_rate'])
         self.linear_lr = config.get('lr_schedule') == 'linear'
+
+        # todo: support max frames as well
         if self.linear_lr:
             self.scheduler = schedulers.LinearScheduler(self.lr, 
-                max_steps=self.max_epochs, 
-                apply_to_entropy=False,
-                start_entropy_coef=0)
+                max_steps = self.max_epochs, 
+                apply_to_entropy = False,
+                start_entropy_coef = 0)
         else:
             self.scheduler = schedulers.IdentityScheduler()
         
         self.mini_epoch = config['mini_epochs']
         assert(('minibatch_size_per_env' in self.config) or ('minibatch_size' in self.config))
+
         self.minibatch_size_per_env = self.config.get('minibatch_size_per_env', 0)
         self.minibatch_size = self.config.get('minibatch_size', self.num_actors * self.minibatch_size_per_env)
         self.num_minibatches = self.horizon_length * self.num_actors // self.minibatch_size
@@ -73,11 +82,22 @@ class CentralValueTrain(nn.Module):
             assert ((self.horizon_length * total_agents // self.num_minibatches) % self.seq_len == 0)
             self.mb_rnn_states = [ torch.zeros((num_seqs, s.size()[0], total_agents, s.size()[2]), dtype=torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
+        if self.multi_gpu:
+            self.rank = int(os.getenv("LOCAL_RANK", "0"))
+            self.rank_size = int(os.getenv("WORLD_SIZE", "1"))
+            # dist.init_process_group("nccl", rank=self.rank, world_size=self.rank_size)
+
+            self.device_name = 'cuda:' + str(self.rank)
+            config['device'] = self.device_name
+            if self.rank != 0:
+                config['print_stats'] = False
+                config['lr_schedule'] = None
+
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, True, self.is_rnn, self.ppo_device, self.seq_len)
 
     def update_lr(self, lr):
         if self.multi_gpu:
-            lr_tensor = torch.tensor([lr], device=self.device)
+            lr_tensor = torch.tensor([lr], device=self.device_name)
             dist.broadcast(lr_tensor, 0)
             lr = lr_tensor.item()
 
@@ -142,8 +162,10 @@ class CentralValueTrain(nn.Module):
             for s, mb_s in zip(self.rnn_states, self.mb_rnn_states):
                 mb_s[n // self.seq_len,:,:,:] = s
 
-    def post_step_rnn(self, all_done_indices):
+    def post_step_rnn(self, all_done_indices, zero_rnn_on_done=True):
         if not self.is_rnn:
+            return
+        if not self.zero_rnn_on_done:
             return
         all_done_indices = all_done_indices[::self.num_agents] // self.num_agents
         for s in self.rnn_states:
@@ -231,19 +253,25 @@ class CentralValueTrain(nn.Module):
                 param.grad = None
         loss.backward()
 
-        #TODO: Refactor this ugliest code of they year
+        if self.multi_gpu:
+            # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
+            all_grads_list = []
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    all_grads_list.append(param.grad.view(-1))
+            all_grads = torch.cat(all_grads_list)
+            dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
+            offset = 0
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.data.copy_(
+                        all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.rank_size
+                    )
+                    offset += param.numel()
+
         if self.truncate_grads:
-            if self.multi_gpu:
-                self.optimizer.synchronize()
-                #self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-                with self.optimizer.skip_synchronize():
-                    self.optimizer.step()
-            else:
-                #self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-                self.optimizer.step()    
-        else:
-            self.optimizer.step()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+
+        self.optimizer.step()
         
         return loss
