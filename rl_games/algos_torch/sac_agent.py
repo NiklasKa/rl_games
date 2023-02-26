@@ -634,4 +634,5 @@ class SACAgent(BaseAlgorithm):
                 update_time = 0
 
                 if should_exit:
+                    del self.vec_env    # necessary to cleanup isaac gym sim
                     return self.last_mean_rewards, self.epoch_num
