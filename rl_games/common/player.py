@@ -3,7 +3,6 @@ import gym
 import numpy as np
 import torch
 import copy
-from rl_games.common import vecenv
 import os
 import re
 from datetime import datetime
@@ -12,6 +11,8 @@ from torch.utils.tensorboard.summary import hparams
 
 from rl_games.common import env_configurations
 from rl_games.algos_torch import model_builder
+from rl_games.common import vecenv
+from rl_games.common.a2c_common import print_statistics
 
 
 class BasePlayer(object):
@@ -54,7 +55,6 @@ class BasePlayer(object):
         self.is_tensor_obses = False
 
         self.states = None
-        self.player_config = self.config.get('player', {})
         self.use_cuda = True
         self.batch_size = 1
         self.has_batch_dimension = False
@@ -71,7 +71,14 @@ class BasePlayer(object):
         self.n_game_life = self.player_config.get('n_game_life', 1)
         self.print_stats = self.player_config.get('print_stats', True)
         self.render_sleep = self.player_config.get('render_sleep', 0.002)
+
         self.max_steps = 108000 // 4
+        self.max_epochs = self.config.get('max_epochs', -1)
+        self.max_frames = self.config.get('max_frames', -1)
+        self.num_actors = config.get('num_actors', 1)
+        self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
+        self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
+
         self.device = torch.device(self.device_name)
 
         self.train_dir = config.get('train_dir', 'runs')
@@ -208,6 +215,9 @@ class BasePlayer(object):
             )[2]), dtype=torch.float32).to(self.device) for s in rnn_states]
 
     def _run(self):
+        total_time_start = time.time()
+        total_time = 0
+        step_time = 0.0
         n_games = self.games_num
         render = self.render_env
         n_game_life = self.n_game_life
@@ -258,9 +268,15 @@ class BasePlayer(object):
                 else:
                     action = self.get_action(obses, is_deterministic)
 
+                step_start = time.time()
                 obses, r, done, info = self.env_step(self.env, action)
+                step_end = time.time()
+
                 cr += r
                 steps += 1
+
+                d_step = step_end - step_start
+                step_time += d_step
 
                 # collect actions if set to true
                 if self.evaluation:
@@ -322,7 +338,10 @@ class BasePlayer(object):
         mean_rewards = sum_rewards / games_played * n_game_life
         mean_lengths = sum_steps / games_played * n_game_life
 
-        return mean_rewards, mean_lengths, games_played, actions if self.evaluation else None
+        total_time_end = time.time()
+        total_time = total_time_start - total_time_end
+
+        return mean_rewards, mean_lengths, games_played, total_time, step_time, actions if self.evaluation else None
 
     def run(self):
         if self.evaluation:
@@ -334,28 +353,30 @@ class BasePlayer(object):
 
             total_time = 0
 
-            checkpoints = list(filter(os.path.isfile, os.listdir(self.eval_nn_dir)))
-            checkpoints = [os.path.join(self.eval_nn_dir, c) for c in checkpoints]
+            checkpoints = [os.path.join(self.eval_nn_dir, c) for c in os.listdir(self.eval_nn_dir)]
             checkpoints.sort(key=lambda x: os.path.getmtime(x))
-
             for fn in checkpoints:
                 # check filename and get frame
-                match = re.search(r"/frame_(\d+).*.pth/gm", fn)
+                match = re.search(r".*/frame_(\d+).*.pth", fn)
+                print(match)
                 if not match:
                     continue
                 frame = int(match.group(1))
-
                 # restore checkpoint
                 self.restore(fn)
 
                 # run evaluation
-                step_start = time.time()
-                mean_rewards, mean_lengths, games_played, actions = self._run()
-                step_end = time.time()
+                mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions = self._run()
 
-                step_time = step_end - step_start
-                fps_step = step_time / (mean_lengths * games_played / self.n_game_life)
-                total_time += step_time
+                curr_frames = (mean_lengths * games_played / self.n_game_life)
+                total_time += epoch_total_time
+                fps_step = curr_frames / step_time
+                fps_total = curr_frames / epoch_total_time
+
+                epoch_num = frame / self.num_frames_per_epoch
+
+                print_statistics(self.print_stats, curr_frames, step_time, total_time, epoch_total_time,
+                                 epoch_num, self.max_epochs, frame, self.max_frames)
 
                 # log action histogram
                 a_min = float(self.action_space.low.min())
@@ -364,7 +385,9 @@ class BasePlayer(object):
                 for  i in range(actions.shape[1]):
                     self.writer.add_histogram(f"actions/dim{i}", actions[:, i], frame, bins=bin_edges)
 
+                self.writer.add_scalar('performance/step_inference_rl_update_fps', fps_total, frame)
                 self.writer.add_scalar('performance/step_fps', fps_step, frame)
+                self.writer.add_scalar('performance/step_time', step_time, frame)
                 self.writer.add_scalar('performance/step_time', step_time, frame)
 
                 self.writer.add_scalar('rewards/step', mean_rewards, frame)
