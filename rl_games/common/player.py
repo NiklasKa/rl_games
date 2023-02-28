@@ -216,7 +216,6 @@ class BasePlayer(object):
 
     def _run(self):
         total_time_start = time.time()
-        total_time = 0
         step_time = 0.0
         n_games = self.games_num
         render = self.render_env
@@ -241,7 +240,7 @@ class BasePlayer(object):
             has_masks = self.env.has_action_mask()
 
         need_init_rnn = self.is_rnn
-        actions = torch.empty((0, 0), device=self.device)
+        actions = []
 
         for _ in range(n_games):
             if games_played >= n_games:
@@ -281,7 +280,7 @@ class BasePlayer(object):
                 # collect actions if set to true
                 if self.evaluation:
                     # save action
-                    actions = torch.cat((actions, action), 0)
+                    actions.append(action)
 
                 if render:
                     self.env.render(mode='human')
@@ -327,7 +326,6 @@ class BasePlayer(object):
                     if batch_size//self.num_agents == 1 or games_played >= n_games:
                         break
 
-        print(sum_rewards)
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps /
                   games_played * n_game_life, 'winrate:', sum_game_res / games_played * n_game_life)
@@ -339,9 +337,9 @@ class BasePlayer(object):
         mean_lengths = sum_steps / games_played * n_game_life
 
         total_time_end = time.time()
-        total_time = total_time_start - total_time_end
+        total_time = total_time_end - total_time_start
 
-        return mean_rewards, mean_lengths, games_played, total_time, step_time, actions if self.evaluation else None
+        return mean_rewards, mean_lengths, games_played, total_time, step_time, torch.vstack(actions).to(self.device) if self.evaluation else None
 
     def run(self):
         if self.evaluation:
@@ -358,7 +356,6 @@ class BasePlayer(object):
             for fn in checkpoints:
                 # check filename and get frame
                 match = re.search(r".*/frame_(\d+).*.pth", fn)
-                print(match)
                 if not match:
                     continue
                 frame = int(match.group(1))
@@ -389,6 +386,8 @@ class BasePlayer(object):
                 self.writer.add_scalar('performance/step_fps', fps_step, frame)
                 self.writer.add_scalar('performance/step_time', step_time, frame)
                 self.writer.add_scalar('performance/step_time', step_time, frame)
+
+                self.writer.add_scalar('info/epochs', epoch_num, frame)
 
                 self.writer.add_scalar('rewards/step', mean_rewards, frame)
                 self.writer.add_scalar('rewards/time', mean_rewards, total_time)
