@@ -215,8 +215,6 @@ class BasePlayer(object):
             )[2]), dtype=torch.float32).to(self.device) for s in rnn_states]
 
     def _run(self):
-        total_time_start = time.time()
-        step_time = 0.0
         n_games = self.games_num
         render = self.render_env
         n_game_life = self.n_game_life
@@ -240,8 +238,6 @@ class BasePlayer(object):
             has_masks = self.env.has_action_mask()
 
         need_init_rnn = self.is_rnn
-        actions = []
-
         for _ in range(n_games):
             if games_played >= n_games:
                 break
@@ -267,20 +263,9 @@ class BasePlayer(object):
                 else:
                     action = self.get_action(obses, is_deterministic)
 
-                step_start = time.time()
                 obses, r, done, info = self.env_step(self.env, action)
-                step_end = time.time()
-
                 cr += r
                 steps += 1
-
-                d_step = step_end - step_start
-                step_time += d_step
-
-                # collect actions if set to true
-                if self.evaluation:
-                    # save action
-                    actions.append(action)
 
                 if render:
                     self.env.render(mode='human')
@@ -295,7 +280,7 @@ class BasePlayer(object):
                     if self.is_rnn:
                         for s in self.states:
                             s[:, all_done_indices, :] = s[:,
-                                                          all_done_indices, :] * 0.0
+                                                        all_done_indices, :] * 0.0
 
                     cur_rewards = cr[done_indices].sum().item()
                     cur_steps = steps[done_indices].sum().item()
@@ -315,17 +300,18 @@ class BasePlayer(object):
                             game_res = info.get('scores', 0.5)
 
                     if self.print_stats:
-                        cur_rewards_done = cur_rewards/done_count
-                        cur_steps_done = cur_steps/done_count
+                        cur_rewards_done = cur_rewards / done_count
+                        cur_steps_done = cur_steps / done_count
                         if print_game_res:
                             print(f'reward: {cur_rewards_done:.1f} steps: {cur_steps_done:.1} w: {game_res:.1}')
                         else:
                             print(f'reward: {cur_rewards_done:.1f} steps: {cur_steps_done:.1f}')
 
                     sum_game_res += game_res
-                    if batch_size//self.num_agents == 1 or games_played >= n_games:
+                    if batch_size // self.num_agents == 1 or games_played >= n_games:
                         break
 
+        print(sum_rewards)
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps /
                   games_played * n_game_life, 'winrate:', sum_game_res / games_played * n_game_life)
@@ -333,13 +319,107 @@ class BasePlayer(object):
             print('av reward:', sum_rewards / games_played * n_game_life,
                   'av steps:', sum_steps / games_played * n_game_life)
 
-        mean_rewards = sum_rewards / games_played * n_game_life
-        mean_lengths = sum_steps / games_played * n_game_life
+    def _run_eval(self):
+        total_time_start = time.time()
+        step_time = 0.0
+        n_games_per_agent = self.games_num
+        n_games = n_games_per_agent * self.num_actors
+        render = self.render_env
+
+        sum_rewards = 0
+        sum_steps = 0
+        games_played = 0
+
+        has_masks_func = getattr(self.env, "has_action_mask", None) is not None
+        has_masks = self.env.has_action_mask() if has_masks_func else False
+
+        op_agent = getattr(self.env, "create_agent", None)
+        if op_agent:
+            agent_inited = True
+
+        need_init_rnn = self.is_rnn
+
+        actions = []    # store evaluation actions
+
+        for _ in range(self.games_num):
+            if games_played >= n_games:
+                break
+
+            obses = self.env_reset(self.env)
+            batch_size = self.get_batch_size(obses, 1)
+
+            if need_init_rnn:
+                self.init_rnn()
+                need_init_rnn = False
+
+            cr = torch.zeros(batch_size, dtype=torch.float32)
+            steps = torch.zeros(batch_size, dtype=torch.float32)
+            agent_finished = torch.zeros(batch_size, dtype=torch.bool)
+
+            # play and collect data until every agent finished once
+            for n in range(self.max_steps):
+                if has_masks:
+                    masks = self.env.get_action_mask()
+                    action = self.get_masked_action(obses, masks, self.is_deterministic)
+                else:
+                    action = self.get_action(obses, self.is_deterministic)
+
+                step_start = time.time()
+                obses, r, done, info = self.env_step(self.env, action)
+                step_end = time.time()
+                d_step = step_end - step_start
+                step_time += d_step
+
+                cr += r
+                steps += 1
+
+                # collect actions
+                actions.append(action[~agent_finished])
+
+                if render:
+                    self.env.render(mode='human')
+                    time.sleep(self.render_sleep)
+
+                all_done_indices = done.nonzero(as_tuple=False)
+                done_indices = all_done_indices[::self.num_agents]
+
+                new_dones = done.to(torch.bool) & (~agent_finished)
+                all_new_done_indices = new_dones.nonzero(as_tuple=False)
+                new_done_indices = all_new_done_indices[::self.num_agents]
+                agent_finished |= new_dones
+
+                done_count = len(done_indices)
+                games_played += len(new_done_indices)
+
+                if done_count > 0:
+                    if self.is_rnn:
+                        for s in self.states:
+                            s[:, all_done_indices, :] *= 0.0
+
+                    cur_rewards = cr[new_done_indices].sum().item()
+                    sum_rewards += cur_rewards
+
+                    cur_steps = steps[new_done_indices].sum().item()
+                    sum_steps += cur_steps
+
+                    cr = cr * (1.0 - done.float())
+                    steps = steps * (1.0 - done.float())
+
+                    if games_played >= n_games or torch.all(agent_finished):
+                        break
+
+        mean_rewards = sum_rewards / games_played
+        mean_lengths = sum_steps / games_played
+
+        print('av reward:', mean_rewards, 'av steps:', mean_lengths)
+
+        actions = torch.vstack(actions).to(self.device)
+        print(actions.shape)
 
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
 
-        return mean_rewards, mean_lengths, games_played, total_time, step_time, torch.vstack(actions).to(self.device) if self.evaluation else None
+        return mean_rewards, mean_lengths, games_played, total_time, step_time, actions
 
     def run(self):
         if self.evaluation:
@@ -359,13 +439,14 @@ class BasePlayer(object):
                 if not match:
                     continue
                 frame = int(match.group(1))
+
                 # restore checkpoint
                 self.restore(fn)
 
                 # run evaluation
-                mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions = self._run()
+                mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions = self._run_eval()
 
-                curr_frames = (mean_lengths * games_played / self.n_game_life)
+                curr_frames = (mean_lengths * games_played)
                 total_time += epoch_total_time
                 fps_step = curr_frames / step_time
                 fps_total = curr_frames / epoch_total_time
