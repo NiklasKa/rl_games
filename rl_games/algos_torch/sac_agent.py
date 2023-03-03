@@ -61,7 +61,7 @@ class SACAgent(BaseAlgorithm):
             'action_dim': self.env_info["action_space"].shape[0],
             'actions_num': self.actions_num,
             'input_shape': obs_shape,
-            'normalize_input': self.normalize_input,
+            'normalize_value': False,
             'normalize_input': self.normalize_input,
         }
         self.model = self.network.build(net_config)
@@ -239,6 +239,10 @@ class SACAgent(BaseAlgorithm):
         state = {'actor': self.model.sac_network.actor.state_dict(),
                  'critic': self.model.sac_network.critic.state_dict(),
                  'critic_target': self.model.sac_network.critic_target.state_dict()}
+
+        if self.normalize_input:
+            state['running_mean_std'] = self.model.running_mean_std.state_dict()
+
         return state
 
     def save(self, fn):
@@ -256,7 +260,7 @@ class SACAgent(BaseAlgorithm):
     def set_full_state_weights(self, weights):
         self.set_weights(weights)
 
-        self.step = weights['step']
+        self.step = weights['steps']
         self.actor_optimizer.load_state_dict(weights['actor_optimizer'])
         self.critic_optimizer.load_state_dict(weights['critic_optimizer'])
         self.log_alpha_optimizer.load_state_dict(weights['log_alpha_optimizer'])

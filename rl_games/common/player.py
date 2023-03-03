@@ -63,11 +63,7 @@ class BasePlayer(object):
         self.device_name = self.config.get('device_name', 'cuda')
         self.render_env = self.player_config.get('render', False)
         self.games_num = self.player_config.get('games_num', 2000)
-        if 'deterministic' in self.player_config:
-            self.is_deterministic = self.player_config['deterministic']
-        else:
-            self.is_deterministic = self.player_config.get(
-                'deterministic', True)
+        self.is_deterministic = self.player_config.get('deterministic', True)
         self.n_game_life = self.player_config.get('n_game_life', 1)
         self.print_stats = self.player_config.get('print_stats', True)
         self.render_sleep = self.player_config.get('render_sleep', 0.002)
@@ -78,6 +74,7 @@ class BasePlayer(object):
         self.num_actors = config.get('num_actors', 1)
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
+        self.step = None
 
         self.device = torch.device(self.device_name)
 
@@ -323,7 +320,6 @@ class BasePlayer(object):
         total_time_start = time.time()
         step_time = 0.0
         n_games_per_agent = self.games_num
-        n_games = n_games_per_agent * self.num_actors
         render = self.render_env
 
         sum_rewards = 0
@@ -334,79 +330,68 @@ class BasePlayer(object):
         has_masks = self.env.has_action_mask() if has_masks_func else False
 
         op_agent = getattr(self.env, "create_agent", None)
-        if op_agent:
-            agent_inited = True
+        if self.is_rnn:
+            self.init_rnn()
 
-        need_init_rnn = self.is_rnn
+        obses = self.env_reset(self.env)
+        batch_size = self.get_batch_size(obses, 1)
 
+        cr = torch.zeros(batch_size, dtype=torch.float32)
+        steps = torch.zeros(batch_size, dtype=torch.float32)
+        games_finished_per_agent = torch.zeros(batch_size, dtype=torch.int32)
         actions = []    # store evaluation actions
 
-        for _ in range(self.games_num):
-            if games_played >= n_games:
-                break
+        while torch.any(games_finished_per_agent.lt(n_games_per_agent)):
+            # play and collect data until every agent finished n_games_per_agent times
+            eval_not_done = games_finished_per_agent.lt(n_games_per_agent)
 
-            obses = self.env_reset(self.env)
-            batch_size = self.get_batch_size(obses, 1)
+            if has_masks:
+                masks = self.env.get_action_mask()
+                action = self.get_masked_action(obses, masks, self.is_deterministic)
+            else:
+                action = self.get_action(obses, self.is_deterministic)
+            legal_actions = torch.zeros_like(action)
+            legal_actions[eval_not_done] = action[eval_not_done]
 
-            if need_init_rnn:
-                self.init_rnn()
-                need_init_rnn = False
+            step_start = time.time()
+            obses, r, done, info = self.env_step(self.env, legal_actions)
+            step_end = time.time()
+            d_step = step_end - step_start
+            step_time += d_step
 
-            cr = torch.zeros(batch_size, dtype=torch.float32)
-            steps = torch.zeros(batch_size, dtype=torch.float32)
-            agent_finished = torch.zeros(batch_size, dtype=torch.bool)
+            cr += r
+            steps += 1
 
-            # play and collect data until every agent finished once
-            for n in range(self.max_steps):
-                if has_masks:
-                    masks = self.env.get_action_mask()
-                    action = self.get_masked_action(obses, masks, self.is_deterministic)
-                else:
-                    action = self.get_action(obses, self.is_deterministic)
+            # collect actions
+            actions.append(action[eval_not_done])
 
-                step_start = time.time()
-                obses, r, done, info = self.env_step(self.env, action)
-                step_end = time.time()
-                d_step = step_end - step_start
-                step_time += d_step
+            all_done_indices = done.nonzero(as_tuple=False)
+            done_indices = all_done_indices[::self.num_agents]
 
-                cr += r
-                steps += 1
+            new_dones = done.to(torch.bool) & eval_not_done
+            all_new_done_indices = new_dones.nonzero(as_tuple=False)
+            new_done_indices = all_new_done_indices[::self.num_agents]
+            games_finished_per_agent += new_dones.int()
 
-                # collect actions
-                actions.append(action[~agent_finished])
+            done_count = len(done_indices)
+            games_played += len(new_done_indices)
 
-                if render:
-                    self.env.render(mode='human')
-                    time.sleep(self.render_sleep)
+            if done_count > 0:
+                if self.is_rnn:
+                    for s in self.states:
+                        s[:, all_done_indices, :] *= 0.0
 
-                all_done_indices = done.nonzero(as_tuple=False)
-                done_indices = all_done_indices[::self.num_agents]
+                cur_rewards = cr[new_done_indices].sum().item()
+                sum_rewards += cur_rewards
 
-                new_dones = done.to(torch.bool) & (~agent_finished)
-                all_new_done_indices = new_dones.nonzero(as_tuple=False)
-                new_done_indices = all_new_done_indices[::self.num_agents]
-                agent_finished |= new_dones
+                cur_steps = steps[new_done_indices].sum().item()
+                sum_steps += cur_steps
 
-                done_count = len(done_indices)
-                games_played += len(new_done_indices)
+                cr = cr * (1.0 - done.float())
+                steps = steps * (1.0 - done.float())
 
-                if done_count > 0:
-                    if self.is_rnn:
-                        for s in self.states:
-                            s[:, all_done_indices, :] *= 0.0
-
-                    cur_rewards = cr[new_done_indices].sum().item()
-                    sum_rewards += cur_rewards
-
-                    cur_steps = steps[new_done_indices].sum().item()
-                    sum_steps += cur_steps
-
-                    cr = cr * (1.0 - done.float())
-                    steps = steps * (1.0 - done.float())
-
-                    if games_played >= n_games or torch.all(agent_finished):
-                        break
+                if torch.all(games_finished_per_agent.ge(n_games_per_agent)):
+                    break
 
         mean_rewards = sum_rewards / games_played
         mean_lengths = sum_steps / games_played
@@ -414,7 +399,6 @@ class BasePlayer(object):
         print('av reward:', mean_rewards, 'av steps:', mean_lengths)
 
         actions = torch.vstack(actions).to(self.device)
-        print(actions.shape)
 
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
@@ -434,14 +418,14 @@ class BasePlayer(object):
             checkpoints = [os.path.join(self.eval_nn_dir, c) for c in os.listdir(self.eval_nn_dir)]
             checkpoints.sort(key=lambda x: os.path.getmtime(x))
             for fn in checkpoints:
-                # check filename and get frame
-                match = re.search(r".*/frame_(\d+).*.pth", fn)
-                if not match:
-                    continue
-                frame = int(match.group(1))
-
                 # restore checkpoint
                 self.restore(fn)
+                if not self.step:
+                    # check filename and get frame
+                    match = re.search(r".*/frame_(\d+).*.pth", fn)
+                    if not match:
+                        continue
+                    self.step = int(match.group(1))
 
                 # run evaluation
                 mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions = self._run_eval()
@@ -451,28 +435,28 @@ class BasePlayer(object):
                 fps_step = curr_frames / step_time
                 fps_total = curr_frames / epoch_total_time
 
-                epoch_num = frame / self.num_frames_per_epoch
+                epoch_num = self.step / self.num_frames_per_epoch
 
                 print_statistics(self.print_stats, curr_frames, step_time, total_time, epoch_total_time,
-                                 epoch_num, self.max_epochs, frame, self.max_frames)
+                                 epoch_num, self.max_epochs, self.step, self.max_frames)
 
                 # log action histogram
                 a_min = float(self.action_space.low.min())
                 a_max = float(self.action_space.high.max())
                 bin_edges = torch.linspace(a_min, a_max, self.num_action_bins + 1)
                 for  i in range(actions.shape[1]):
-                    self.writer.add_histogram(f"actions/dim{i}", actions[:, i], frame, bins=bin_edges)
+                    self.writer.add_histogram(f"actions/dim{i}", actions[:, i], self.step, bins=bin_edges)
 
-                self.writer.add_scalar('performance/step_inference_rl_update_fps', fps_total, frame)
-                self.writer.add_scalar('performance/step_fps', fps_step, frame)
-                self.writer.add_scalar('performance/step_time', step_time, frame)
-                self.writer.add_scalar('performance/step_time', step_time, frame)
+                self.writer.add_scalar('performance/step_inference_rl_update_fps', fps_total, self.step)
+                self.writer.add_scalar('performance/step_fps', fps_step, self.step)
+                self.writer.add_scalar('performance/step_time', step_time, self.step)
+                self.writer.add_scalar('performance/step_time', step_time, self.step)
 
-                self.writer.add_scalar('info/epochs', epoch_num, frame)
+                self.writer.add_scalar('info/epochs', epoch_num, self.step)
 
-                self.writer.add_scalar('rewards/step', mean_rewards, frame)
+                self.writer.add_scalar('rewards/step', mean_rewards, self.step)
                 self.writer.add_scalar('rewards/time', mean_rewards, total_time)
-                self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
+                self.writer.add_scalar('episode_lengths/step', mean_lengths, self.step)
                 self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
 
         else:
