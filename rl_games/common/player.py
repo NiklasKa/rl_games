@@ -9,6 +9,8 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.tensorboard.summary import hparams
 
+from rl_games.algos_torch import torch_ext
+
 from rl_games.common import env_configurations
 from rl_games.algos_torch import model_builder
 from rl_games.common import vecenv
@@ -63,7 +65,7 @@ class BasePlayer(object):
         self.device_name = self.config.get('device_name', 'cuda')
         self.render_env = self.player_config.get('render', False)
         self.games_num = self.player_config.get('games_num', 2000)
-        self.is_deterministic = self.player_config.get('deterministic', True)
+        self.is_deterministic = self.player_config.get('deterministic', False)
         self.n_game_life = self.player_config.get('n_game_life', 1)
         self.print_stats = self.player_config.get('print_stats', True)
         self.render_sleep = self.player_config.get('render_sleep', 0.002)
@@ -81,11 +83,14 @@ class BasePlayer(object):
         self.train_dir = config.get('train_dir', 'runs')
         self.experiment_dir = os.path.join(self.train_dir, config['name'])
 
-        self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn')
+        self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn' if not self.is_deterministic else 'eval_nn_det')
+        self.eval_obs_dir = os.path.join(self.experiment_dir, 'eval_obs' if not self.is_deterministic else 'eval_obs_det')
         os.makedirs(self.eval_nn_dir, exist_ok=True)
+        os.makedirs(self.eval_obs_dir, exist_ok=True)
 
         self.evaluation = self.player_config.get("evaluation", False) # run player as evaluation player to evaluate new checkpoints
         self.num_action_bins = config.get("num_action_bins", 100)
+        self.save_observations = self.config.get("save_observations", False)
 
         self.writer = SummaryWriter(self.experiment_dir)
 
@@ -340,6 +345,7 @@ class BasePlayer(object):
         steps = torch.zeros(batch_size, dtype=torch.float32)
         games_finished_per_agent = torch.zeros(batch_size, dtype=torch.int32)
         actions = []    # store evaluation actions
+        observations = []   # store observations
 
         while torch.any(games_finished_per_agent.lt(n_games_per_agent)):
             # play and collect data until every agent finished n_games_per_agent times
@@ -364,6 +370,10 @@ class BasePlayer(object):
 
             # collect actions
             actions.append(action[eval_not_done])
+
+            # collect observations
+            if self.save_observations:
+                observations.append(obses[eval_not_done])
 
             all_done_indices = done.nonzero(as_tuple=False)
             done_indices = all_done_indices[::self.num_agents]
@@ -399,11 +409,12 @@ class BasePlayer(object):
         print('av reward:', mean_rewards, 'av steps:', mean_lengths)
 
         actions = torch.vstack(actions).to(self.device)
+        observations = torch.vstack(observations).to(self.device)
 
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
 
-        return mean_rewards, mean_lengths, games_played, total_time, step_time, actions
+        return mean_rewards, mean_lengths, games_played, total_time, step_time, actions, observations
 
     def run(self):
         if self.evaluation:
@@ -428,7 +439,7 @@ class BasePlayer(object):
                     self.step = int(match.group(1))
 
                 # run evaluation
-                mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions = self._run_eval()
+                mean_rewards, mean_lengths, games_played, epoch_total_time, step_time, actions, observations = self._run_eval()
 
                 curr_frames = (mean_lengths * games_played)
                 total_time += epoch_total_time
@@ -446,6 +457,12 @@ class BasePlayer(object):
                 bin_edges = torch.linspace(a_min, a_max, self.num_action_bins + 1)
                 for  i in range(actions.shape[1]):
                     self.writer.add_histogram(f"actions/dim{i}", actions[:, i], self.step, bins=bin_edges)
+
+                # save observations
+                if self.save_observations:
+                    # create filename
+                    fn = os.path.join(self.eval_obs_dir, self.config['name'] + '_ep_' + str(epoch_num) + ".pth")
+                    torch_ext.safe_filesystem_op(torch.save, observations, fn)
 
                 self.writer.add_scalar('performance/step_inference_rl_update_fps', fps_total, self.step)
                 self.writer.add_scalar('performance/step_fps', fps_step, self.step)

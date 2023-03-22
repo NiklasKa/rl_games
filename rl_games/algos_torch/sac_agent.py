@@ -159,6 +159,7 @@ class SACAgent(BaseAlgorithm):
         self.save_best_after = config.get('save_best_after', 500)
         self.save_frequency = self.config.get("save_frequency", 50)
         self.eval_frequency = self.config.get("eval_frequency", 10)
+        self.save_observations = self.config.get("save_observations", False)
         self.print_stats = config.get('print_stats', True)
         self.rnn_states = None
         self.name = base_name
@@ -193,8 +194,9 @@ class SACAgent(BaseAlgorithm):
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
         self.eval_nn_dir = os.path.join(self.experiment_dir, 'eval_nn')
         self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
+        self.obs_dir = os.path.join(self.experiment_dir, 'obs')
 
-        for d in [self.train_dir, self.experiment_dir, self.nn_dir, self.eval_nn_dir, self.summaries_dir]:
+        for d in [self.train_dir, self.experiment_dir, self.nn_dir, self.eval_nn_dir, self.summaries_dir, self.obs_dir]:
             os.makedirs(d, exist_ok=True)
 
         self.writer = SummaryWriter(self.experiment_dir)
@@ -454,6 +456,9 @@ class SACAgent(BaseAlgorithm):
         critic1_losses = []
         critic2_losses = []
 
+        # allocate observation buffer for saving obs
+        observations = torch.empty((self.num_steps_per_episode, self.num_actors, *self.env_info["observation_space"].shape)).to(self._device)
+
         obs = self.obs
         for s in range(self.num_steps_per_episode):
             self.set_eval()
@@ -499,6 +504,10 @@ class SACAgent(BaseAlgorithm):
 
             self.replay_buffer.add(obs, action, torch.unsqueeze(rewards, 1), next_obs, torch.unsqueeze(dones, 1))
 
+            # log observation
+            if self.save_observations:
+                observations[s] = obs
+
             self.obs = obs = next_obs.clone()
 
             if not random_exploration:
@@ -522,6 +531,12 @@ class SACAgent(BaseAlgorithm):
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
         play_time = total_time - total_update_time
+
+        # save observation
+        if self.save_observations:
+            # create filename
+            fn = os.path.join(self.obs_dir, self.config['name'] + '_ep_' + str(self.epoch_num) + ".pth")
+            torch_ext.safe_filesystem_op(torch.save, observations, fn)
 
         return step_time, play_time, total_update_time, total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses
 
