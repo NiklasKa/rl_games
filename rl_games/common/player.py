@@ -409,7 +409,9 @@ class BasePlayer(object):
         print('av reward:', mean_rewards, 'av steps:', mean_lengths)
 
         actions = torch.vstack(actions).to(self.device)
-        observations = torch.vstack(observations).to(self.device)
+
+        if self.save_observations:
+            observations = torch.vstack(observations).to(self.device)
 
         total_time_end = time.time()
         total_time = total_time_end - total_time_start
