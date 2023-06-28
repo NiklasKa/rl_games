@@ -1,11 +1,11 @@
-import numpy as np
 import random
-import gym
-import torch
-from rl_games.common.segment_tree import SumSegmentTree, MinSegmentTree
-import torch
 
+import gym
+import numpy as np
+import torch
 from rl_games.algos_torch.torch_ext import numpy_to_torch_dtype_dict
+from rl_games.common.segment_tree import SumSegmentTree, MinSegmentTree
+
 
 class ReplayBuffer(object):
     def __init__(self, size, ob_space):
@@ -279,7 +279,71 @@ class VectorizedReplayBuffer:
         return obses, actions, rewards, next_obses, dones
 
 
+class PrioritizedOnlineReplayBuffer(VectorizedReplayBuffer):
+    def __init__(self, obs_shape, action_shape, capacity, online_size, device):
+        """Create Prioritized Replay buffer.
+        Parameters
+        ----------
+        capacity: int
+            Max number of transitions to store in the buffer. When the buffer
+            overflows the old memories are dropped.
+        online_size: int
+            Number of transitions used to sample the online data.
+        See Also
+        --------
+        ReplayBuffer.__init__
+        """
+        super(VectorizedReplayBuffer, self).__init__(obs_shape, action_shape, capacity, device)
+        self.online_size = online_size
 
+    def sample(self, batch_size, online_portion=None):
+        """Sample a batch of experiences.
+        Parameters
+        ----------
+        batch_size: int
+            How many transitions to sample.
+        online_portion: float
+            Portion of online samples of batch size.
+        Returns
+        -------
+        obses: torch tensor
+            batch of observations
+        actions: torch tensor
+            batch of actions executed given obs
+        rewards: torch tensor
+            rewards received as results of executing act_batch
+        next_obses: torch tensor
+            next set of observations seen after executing act_batch
+        not_dones_no_max: torch tensor
+            inverse of whether the episode ended at this tuple of (observation, action) or not, specifically exlcuding maximum episode steps
+        """
+
+        if online_portion is None:
+            return super().sample(batch_size)
+
+        online_portion = max(min(online_portion, 1.0), 0.0)
+        online_batch_size = int(batch_size * online_portion)
+        offline_batch_size = batch_size - online_batch_size
+
+        # get offline batch indexes from complete replay buffer
+        offline_idxs = torch.randint(0,
+                                     self.capacity if self.full else self.idx,
+                                     (offline_batch_size,), device=self.device)
+
+        # get online batch indexes from online part of the replay buffer
+        online_idxs = torch.randint(
+            0 if not self.full and self.idx < online_batch_size else self.idx - online_batch_size,
+            self.idx,
+            (online_batch_size,), device=self.device)
+
+        idxs = torch.cat((offline_idxs, online_idxs), 0)
+        obses = self.obses[idxs]
+        actions = self.actions[idxs]
+        rewards = self.rewards[idxs]
+        next_obses = self.next_obses[idxs]
+        dones = self.dones[idxs]
+
+        return obses, actions, rewards, next_obses, dones
 
 
 class ExperienceBuffer:
