@@ -1,20 +1,17 @@
-from rl_games.algos_torch import torch_ext
+import os
+import time
 
-from rl_games.common import vecenv
-from rl_games.common import experience
-from rl_games.common.a2c_common import print_statistics
+import numpy as np
+import torch
 from rl_games.algos_torch import model_builder
-
-from rl_games.interfaces.base_algorithm import  BaseAlgorithm
+from rl_games.algos_torch import torch_ext
+from rl_games.common import experience
+from rl_games.common import vecenv
+from rl_games.common.a2c_common import print_statistics
+from rl_games.interfaces.base_algorithm import BaseAlgorithm
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.tensorboard.summary import hparams
-import torch
-from torch import nn
-import numpy as np
-import time
-from datetime import datetime
-import os
-
 
 
 class SACAgent(BaseAlgorithm):
@@ -38,6 +35,7 @@ class SACAgent(BaseAlgorithm):
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.normalize_input = config.get("normalize_input", False)
         self.num_rl_updates = config.get("num_rl_updates", 1)
+        self.buffer_online_factor = config.get("buffer_online_factor", 0.0)
 
         self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
 
@@ -81,10 +79,15 @@ class SACAgent(BaseAlgorithm):
                                                     lr=float(self.config["alpha_lr"]),
                                                     betas=self.config.get("alphas_betas", [0.9, 0.999]))
 
-        self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
-                                                               self.env_info['action_space'].shape,
-                                                               self.replay_buffer_size,
-                                                               self._device)
+        # self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
+        #                                                        self.env_info['action_space'].shape,
+        #                                                        self.replay_buffer_size,
+        #                                                        self._device)
+        self.replay_buffer = experience.PrioritizedOnlineReplayBuffer(self.env_info['observation_space'].shape,
+                                                                      self.env_info['action_space'].shape,
+                                                                      self.replay_buffer_size,
+                                                                      self.batch_size * self.num_rl_updates,
+                                                                      self._device)
         self.target_entropy_coef = config.get("target_entropy_coef", 1.0)
         self.target_entropy = self.target_entropy_coef * -self.env_info['action_space'].shape[0]
         print("Target entropy", self.target_entropy)
@@ -342,7 +345,8 @@ class SACAgent(BaseAlgorithm):
                                     (1.0 - tau) * target_param.data)
 
     def update(self, step):
-        obs, action, reward, next_obs, done = self.replay_buffer.sample(self.batch_size)
+        # obs, action, reward, next_obs, done = self.replay_buffer.sample(self.batch_size)
+        obs, action, reward, next_obs, done = self.replay_buffer.sample(self.batch_size, self.buffer_online_factor)
         not_done = ~done
 
         obs = self.preproc_obs(obs)
