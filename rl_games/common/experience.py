@@ -293,7 +293,7 @@ class PrioritizedOnlineReplayBuffer(VectorizedReplayBuffer):
         --------
         ReplayBuffer.__init__
         """
-        super(VectorizedReplayBuffer, self).__init__(obs_shape, action_shape, capacity, device)
+        super().__init__(obs_shape, action_shape, capacity, device)
         self.online_size = online_size
 
     def sample(self, batch_size, online_portion=None):
